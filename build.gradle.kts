@@ -20,7 +20,7 @@ allprojects {
 		mavenCentral()
 	}
 	val versionMajor by extra(1)
-	val versionMinor by extra(0)
+	val versionMinor by extra(1)
 	val versionPatch by extra(1)
 	val versionClassifier by extra("SNAPSHOT")
 
@@ -36,7 +36,7 @@ task<Delete>("clean") {
 
 fun getVersionName(): String {
 	val versionMajor by extra(1)
-	val versionMinor by extra(0)
+	val versionMinor by extra(1)
 	val versionPatch by extra(1)
 	var versionName = "${versionMajor}.${versionMinor}.${versionPatch}"
 

@@ -20,10 +20,13 @@
 
 package mycroft.ai
 
+import android.Manifest
 import android.app.Activity
 import android.content.*
 import android.content.pm.PackageManager
+import android.media.MediaRecorder
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.preference.PreferenceManager
@@ -34,8 +37,11 @@ import android.view.MenuItem
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.TextView
+import androidx.annotation.RequiresApi
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.Toolbar
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import androidx.recyclerview.widget.LinearLayoutManager
 import mycroft.ai.Constants.MycroftMobileConstants.VERSION_CODE_PREFERENCE_KEY
@@ -51,8 +57,13 @@ import mycroft.ai.utils.NetworkUtil
 import org.java_websocket.client.WebSocketClient
 import org.java_websocket.exceptions.WebsocketNotConnectedException
 import org.java_websocket.handshake.ServerHandshake
+import java.io.File
+import java.io.IOException
 import java.net.URI
 import java.net.URISyntaxException
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.Paths
 import java.util.*
 
 class MainActivity : AppCompatActivity() {
@@ -66,6 +77,14 @@ class MainActivity : AppCompatActivity() {
 	private var isWearBroadcastRevieverRegistered = false
 	private var launchedFromWidget = false
 	private var autoPromptForSpeech = false
+
+	private var mediaRecorder: MediaRecorder? = null
+    private var isRecording = false
+	private var latestFilePath: String? = null
+
+	enum class MessageType {
+		UTTERANCE, FILE
+	}
 
 	private lateinit var ttsManager: TTSManager
 	private lateinit var mycroftAdapter: MycroftAdapter
@@ -114,6 +133,18 @@ class MainActivity : AppCompatActivity() {
 			}
 		}
 
+		if (ContextCompat.checkSelfPermission(
+						this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED &&
+				ContextCompat.checkSelfPermission(
+						this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+			val permissions = arrayOf(android.Manifest.permission.RECORD_AUDIO, android.Manifest.permission.WRITE_EXTERNAL_STORAGE, android.Manifest.permission.READ_EXTERNAL_STORAGE)
+			ActivityCompat.requestPermissions(this, permissions,0)
+		}
+
+		//recorder
+		mediaRecorder = MediaRecorder()
+		resetRecorder()
+
 		binding.contentMain.utteranceInput.setOnEditorActionListener(TextView.OnEditorActionListener { _, actionId, _ ->
 			if (actionId == EditorInfo.IME_ACTION_DONE) {
 				sendUtterance()
@@ -122,7 +153,7 @@ class MainActivity : AppCompatActivity() {
 				false
 			}
 		})
-		binding.contentMain.micButton.setOnClickListener { promptSpeechInput() }
+		binding.contentMain.micButton.setOnClickListener { speechInputHandler() }
 		binding.contentMain.sendUtterance.setOnClickListener { sendUtterance() }
 
 		registerForContextMenu(binding.contentMain.cardList)
@@ -150,6 +181,15 @@ class MainActivity : AppCompatActivity() {
 
 		// start the discovery activity (testing only)
 		// startActivity(new Intent(this, DiscoveryActivity.class));
+	}
+
+	private fun resetRecorder() {
+        mediaRecorder?.reset()
+		mediaRecorder?.setAudioSource(MediaRecorder.AudioSource.MIC)
+		mediaRecorder?.setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
+		mediaRecorder?.setAudioEncoder(MediaRecorder.AudioEncoder.AMR_WB)
+        mediaRecorder?.setAudioSamplingRate(16_000)
+		mediaRecorder?.setMaxFileSize(1_000_000)
 	}
 
 	override fun onCreateOptionsMenu(menu: Menu): Boolean {
@@ -184,7 +224,7 @@ class MainActivity : AppCompatActivity() {
 		super.onContextItemSelected(item)
 		if (item.itemId == R.id.user_resend) {
 			// Resend user utterance
-			sendMessage(utterances[currentItemPosition].utterance)
+			sendMessage(utterances[currentItemPosition].utterance, MessageType.UTTERANCE)
 		} else if (item.itemId == R.id.user_copy || item.itemId == R.id.mycroft_copy) {
 			// Copy utterance to clipboard
 			val clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -214,7 +254,7 @@ class MainActivity : AppCompatActivity() {
 	fun sendUtterance() {
 		val utterance = binding.contentMain.utteranceInput.text.toString()
 		if (utterance != "") {
-			sendMessage(utterance)
+			sendMessage(utterance, MessageType.UTTERANCE)
 			binding.contentMain.utteranceInput.text.clear()
 		}
 	}
@@ -289,7 +329,7 @@ class MainActivity : AppCompatActivity() {
 					// send to mycroft
 					if (message != null) {
 						Log.d(logTag, "Wear message received: [$message] sending to Mycroft")
-						sendMessage(message)
+						sendMessage(message, MessageType.UTTERANCE)
 					}
 				}
 			}
@@ -338,9 +378,26 @@ class MainActivity : AppCompatActivity() {
 		}
 	}
 
-	fun sendMessage(msg: String) {
+	fun sendMessage(msg: String, type: MessageType) {
+        when (type) {
+        	MessageType.UTTERANCE -> sendUtteranceMessage(msg)
+			MessageType.FILE -> sendFileMessage(msg)
+        }
+	}
+
+	private fun sendUtteranceMessage(msg: String) {
 		val json =
-			"{\"data\": {\"utterances\": [\"$msg\"]}, \"type\": \"recognizer_loop:utterance\", \"context\": null}"
+				"{\"data\": {\"utterances\": [\"$msg\"]}, \"type\": \"recognizer_loop:utterance\", \"context\": null}"
+        sendRawMessage(msg, json)
+	}
+
+	private fun sendFileMessage(msg: String) {
+		val json =
+				"{\"data\": {\"filebytes\": \"$msg\"}, \"type\": \"mycroft.mic.recordedfile\", \"context\": null}"
+		sendRawMessage(msg, json)
+	}
+
+	private fun sendRawMessage(msg: String, json: String) {
 
 		try {
 			if (webSocketClient == null || webSocketClient!!.connection.isClosed) {
@@ -367,6 +424,36 @@ class MainActivity : AppCompatActivity() {
 
 	}
 
+	private fun speechInputHandler() {
+		if (!isRecording) {
+			try {
+				promptSpeechInput()
+			} catch (a: ActivityNotFoundException) {
+				showToast(getString(R.string.speech_not_supported))
+				if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+					try {
+						var file = File.createTempFile("recording", "tmpfile")
+						latestFilePath = file.path
+						startRecording(file)
+					} catch (e: IOException) {
+						showToast("could not create file")
+					}
+				} else {
+					showToast("You don't have the thing!")
+				}
+			}
+		} else {
+			stopRecording()
+			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+				val p = Paths.get(latestFilePath)
+				if (Files.exists(p)) {
+					sendFile(p)
+				}
+			}
+			resetRecorder()
+		}
+	}
+
 	/**
 	 * Showing google speech input dialog
 	 */
@@ -381,12 +468,40 @@ class MainActivity : AppCompatActivity() {
 			RecognizerIntent.EXTRA_PROMPT,
 			getString(R.string.speech_prompt)
 		)
-		try {
-			startActivityForResult(intent, reqCodeSpeechInput)
-		} catch (a: ActivityNotFoundException) {
-			showToast(getString(R.string.speech_not_supported))
-		}
+		startActivityForResult(intent, reqCodeSpeechInput)
+	}
 
+	@RequiresApi(Build.VERSION_CODES.O)
+	private fun startRecording(file: File) {
+		try {
+			mediaRecorder?.setOutputFile(file)
+			mediaRecorder?.prepare()
+			isRecording = true
+			mediaRecorder?.start()
+            showToast("Recording!")
+		} catch (e: IllegalStateException) {
+			showToast("Illegal state, resetting recorder")
+			resetRecorder()
+		} catch (e: IOException) {
+			e.printStackTrace()
+		}
+	}
+
+	private fun stopRecording() {
+		mediaRecorder?.stop()
+		isRecording = false
+	}
+
+	@RequiresApi(Build.VERSION_CODES.O)
+	private fun encoder(filePath: Path): String {
+		val bytes = filePath.toFile().readBytes()
+		return Base64.getEncoder().encodeToString(bytes)
+	}
+
+	@RequiresApi(Build.VERSION_CODES.O)
+	private fun sendFile(filePath: Path) {
+		val encodedFile = encoder(filePath)
+        sendMessage(encodedFile, MessageType.FILE)
 	}
 
 	/**
@@ -402,7 +517,7 @@ class MainActivity : AppCompatActivity() {
 					val result = data
 						.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
 
-					sendMessage(result[0])
+					sendMessage(result[0], MessageType.UTTERANCE)
 				}
 			}
 		}
@@ -481,7 +596,7 @@ class MainActivity : AppCompatActivity() {
 					logTag,
 					"checkIfLaunchedFromWidget - extras contain key:$MYCROFT_WEAR_REQUEST_KEY_NAME"
 				)
-				extras.getString(MYCROFT_WEAR_REQUEST_KEY_NAME)?.let { sendMessage(it) }
+				extras.getString(MYCROFT_WEAR_REQUEST_KEY_NAME)?.let { sendMessage(it, MessageType.UTTERANCE) }
 				getIntent().removeExtra(MYCROFT_WEAR_REQUEST_KEY_NAME)
 			}
 		}
